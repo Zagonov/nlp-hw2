@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Local credentials and machine-specific connection details
+codes.txt
+*.pem
+*.key
+
+# Local data, model weights, and generated predictions
+data/
+checkpoints/
+outputs/
+runs/
+wandb/
+comet/
+*.safetensors
+*.pt
+*.pth
+predictions*.jsonl
+*.jsonl.partial
+one_batch_test/
+kaggle-beam3-code/
+kaggle-beam3-code.zip

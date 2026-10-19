@@ -1,0 +1,21 @@
+# Core model training and inference
+torch==2.14.1
+numpy==2.5.4
+safetensors==0.8.0
+
+# Dataset and tokenizer pipeline
+datasets==4.8.5
+tokenizers==0.23.3
+pandas==3.0.6
+tqdm==4.70.1
+
+# Experiment tracking and notebooks
+tensorboard==2.21.0
+comet-ml==3.58.8
+jupyterlab==4.6.4
+ipykernel==7.4.0
+matplotlib==3.11.2
+
+# Tests and code quality
+pytest==9.1.1
+ruff==0.17.1
