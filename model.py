@@ -64,14 +64,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout,
-        max_position_embeddings=4096,
-        use_rotary=True,
-    ):
+    def __init__(self, d_model, n_heads, dropout, max_position_embeddings=4096):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
@@ -79,11 +72,7 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.dropout = dropout
-        self.rotary = (
-            RotaryEmbedding(self.head_dim, max_position_embeddings)
-            if use_rotary
-            else None
-        )
+        self.rotary = RotaryEmbedding(self.head_dim, max_position_embeddings)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
@@ -108,13 +97,13 @@ class Attention(nn.Module):
         key_positions=None,
     ):
         q = self.split_heads(self.q_proj(query))
-        if self.rotary is not None and query_positions is not None:
+        if query_positions is not None:
             q = self.rotary(q, query_positions)
 
         if key_value is None:
             k = self.split_heads(self.k_proj(query))
             v = self.split_heads(self.v_proj(query))
-            if self.rotary is not None and key_positions is not None:
+            if key_positions is not None:
                 k = self.rotary(k, key_positions)
             if cache is not None:
                 k = torch.cat((cache[0], k), dim=2)
@@ -122,7 +111,7 @@ class Attention(nn.Module):
         elif cache is None:
             k = self.split_heads(self.k_proj(key_value))
             v = self.split_heads(self.v_proj(key_value))
-            if self.rotary is not None and key_positions is not None:
+            if key_positions is not None:
                 k = self.rotary(k, key_positions)
         else:
             k, v = cache
@@ -189,7 +178,6 @@ class DecoderLayer(nn.Module):
         self.cross_attention = Attention(
             config.d_model, config.n_heads, config.dropout,
             max(config.max_source_length, config.max_target_length),
-            use_rotary=False,
         )
         self.feed_forward = SwiGLU(config.d_model, config.d_ff, config.dropout)
         self.dropout = nn.Dropout(config.dropout)
@@ -203,6 +191,7 @@ class DecoderLayer(nn.Module):
         cross_cache=None,
         incremental=False,
         target_positions=None,
+        source_positions=None,
     ):
         output, self_cache = self.self_attention(
             self.norm1(x),
@@ -218,6 +207,8 @@ class DecoderLayer(nn.Module):
             key_value=encoder_output,
             attention_mask=source_mask,
             cache=cross_cache,
+            query_positions=target_positions,
+            key_positions=source_positions,
         )
         x = x + self.dropout(output)
         x = x + self.dropout(self.feed_forward(self.norm3(x)))
@@ -281,6 +272,9 @@ class Transformer(nn.Module):
             raise ValueError("target sequence is too long")
 
         positions = torch.arange(offset, offset + length, device=target_ids.device)
+        source_positions = torch.arange(
+            encoder_output.shape[1], device=target_ids.device
+        )
         x = self.target_embedding(target_ids)
         x = self.dropout(x)
 
@@ -296,6 +290,7 @@ class Transformer(nn.Module):
                 cross_cache,
                 incremental,
                 positions,
+                source_positions,
             )
             new_cache.append(layer_cache)
 
