@@ -58,7 +58,20 @@ python tokenizer.py \
   --target-output target_tokenizer.json
 ```
 
-Source-токенизатор обучается только на поле `question`, target-токенизатор — только на очищенном поле `code`.
+Для нового обучения используется один общий токенизатор на вопросах и очищенном
+Python-коде:
+
+```bash
+python tokenizer.py \
+  --input data/train_clean \
+  --shared-output shared_tokenizer.json \
+  --shared-vocab-size 8192 \
+  --min-frequency 10
+```
+
+Каждая цифра выделяется в самостоятельный токен до BPE, поэтому словарь не
+запоминает отдельные токены для конкретных чисел. Один и тот же файл передаётся в
+обучение как `--source-tokenizer` и `--target-tokenizer`.
 
 ## Проверка обучения
 
@@ -85,7 +98,8 @@ python train.py \
 
 ## Обучение на RTX 4090
 
-На Vast.ai нужно перенести исходники проекта, каталог `data/train_clean`, `source_tokenizer.json` и `target_tokenizer.json`, после чего установить зависимости:
+На Vast.ai нужно перенести исходники проекта, каталог `data/train_clean` и
+`shared_tokenizer.json`, после чего установить зависимости:
 
 ```bash
 python3 -m venv .venv
@@ -105,8 +119,8 @@ bash run_train.sh
 ```bash
 python train.py \
   --dataset data/train_clean \
-  --source-tokenizer source_tokenizer.json \
-  --target-tokenizer target_tokenizer.json \
+  --source-tokenizer shared_tokenizer.json \
+  --target-tokenizer shared_tokenizer.json \
   --batch-size 80 \
   --gradient-accumulation 2 \
   --d-model 640 \
@@ -115,7 +129,7 @@ python train.py \
   --encoder-layers 8 \
   --decoder-layers 8 \
   --epochs 1 \
-  --learning-rate 3e-4 \
+  --learning-rate 1e-4 \
   --max-source-length 192 \
   --max-target-length 256 \
   --validation-size 10000 \
@@ -136,13 +150,13 @@ python train.py \
 Модель обучается в BF16 на RTX 4090. На видеокартах без BF16 используется FP16, на CPU смешанная точность отключается.
 
 Во время обучения `latest.pt` перезаписывается каждые `checkpoint-every` шагов.
-Каждые `validate-every` шагов (по умолчанию 1000) считается validation loss.
-Если он улучшился, обновляются полный `best.pt` и облегчённый
-`inference-best.pt`; облегчённая лучшая версия также загружается в Comet с номером
-шага в имени.
-Если validation loss не улучшается в течение `early-stopping-patience` проверок,
+Каждые `validate-every` шагов (по умолчанию 1000) считается validation loss и
+execution accuracy на фиксированной validation-подвыборке. Если execution accuracy
+улучшилась, обновляются полный `best.pt` и облегчённый `inference-best.pt`;
+облегчённая лучшая версия также загружается в Comet с номером шага в имени.
+Если execution accuracy не улучшается в течение `early-stopping-patience` проверок,
 обучение завершается досрочно, сохраняя лучшую найденную модель. При необходимости
-минимально значимое улучшение можно задать через `early-stopping-min-delta`;
+минимально значимое улучшение accuracy можно задать через `early-stopping-min-delta`;
 по умолчанию оно равно нулю. Норма градиента логируется как `train/gradient_norm`, а
 нечисловая норма немедленно останавливает запуск до повреждения следующих
 checkpoints.
@@ -165,8 +179,10 @@ checkpoints автоматически загружаются в Comet. Откл
 `inference-final` соответственно.
 
 Рабочий запуск использует learning rate `5e-5`, warmup 5% и отдельный каталог
-`checkpoints/transformer-100m-lr5e5`, чтобы не продолжать обучение из
+`checkpoints/transformer-100m-shared-tokenizer`, чтобы не продолжать обучение из
 деградировавшего checkpoint старого запуска с learning rate `3e-4`.
+В новой конфигурации используются RMSNorm и SwiGLU; размер внутреннего слоя
+SwiGLU автоматически подбирается так, чтобы сохранить примерно прежний FFN-бюджет.
 
 Продолжение прерванного запуска выполняется той же командой и с теми же параметрами модели, но с дополнительным аргументом:
 
@@ -174,7 +190,41 @@ checkpoints автоматически загружаются в Comet. Откл
 bash run_train.sh --resume checkpoints/transformer-100m/latest.pt
 ```
 
+Для дообучения завершённой модели с новым optimizer и расписанием learning rate
+используется полный checkpoint и отдельный каталог:
+
+```bash
+python train.py \
+  --dataset data/train_clean \
+  --source-tokenizer shared_tokenizer.json \
+  --target-tokenizer shared_tokenizer.json \
+  --batch-size 80 \
+  --gradient-accumulation 2 \
+  --d-model 640 \
+  --n-heads 10 \
+  --d-ff 2560 \
+  --encoder-layers 8 \
+  --decoder-layers 8 \
+  --learning-rate 1e-5 \
+  --warmup-ratio 0.05 \
+  --finetune-from checkpoints/final/latest.pt \
+  --finetune-steps 10000 \
+  --output checkpoints/finetune-100m \
+  --comet-project hw2-code-generation
+```
+
+`--finetune-from` загружает только веса модели, а optimizer и scheduler создаются
+заново. Номер шага продолжает нумерацию исходного запуска; исходный checkpoint не
+перезаписывается.
+
 В Comet записываются `train/loss`, `train/lr`, `train/optimizer_step`, `train/samples_seen`, скорость обработки примеров и `validation/loss`. При продолжении обучения логирование идёт в тот же эксперимент.
+
+На каждом validation-шаге дополнительно генерируются первые 1000 validation-примеров,
+код исполняется, а числовые ответы сравниваются с ответами эталонных программ
+(`rtol=atol=1e-6`). В Comet записываются `validation/execution_accuracy`, доля
+успешно исполнившихся генераций и число совпавших ответов. По умолчанию для этой
+метрики используется greedy decoding; число примеров и beam width можно изменить
+через `--validation-generation-samples` и `--validation-generation-beams`.
 
 Для локального запуска без отправки данных:
 

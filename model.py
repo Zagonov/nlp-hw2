@@ -17,10 +17,54 @@ class ModelConfig:
     max_source_length: int = 192
     max_target_length: int = 256
     dropout: float = 0.1
+    norm_eps: float = 1e-6
+
+
+class RMSNorm(nn.Module):
+    """Root-mean-square normalization used by modern decoder transformers."""
+
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps).to(dtype=x.dtype)
+        return self.weight.to(dtype=x.dtype) * x
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim, max_position_embeddings=4096, base=10000.0):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError("RoPE requires an even attention head dimension")
+        inverse_frequency = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2).float() / head_dim)
+        )
+        positions = torch.arange(max_position_embeddings).float()
+        angles = torch.outer(positions, inverse_frequency)
+        self.register_buffer("cos", angles.cos(), persistent=False)
+        self.register_buffer("sin", angles.sin(), persistent=False)
+
+    def forward(self, x, positions):
+        # x: [batch, heads, sequence, head_dim], positions: [sequence]
+        if positions.numel() == 0:
+            return x
+        cos = self.cos.index_select(0, positions).to(dtype=x.dtype)
+        sin = self.sin.index_select(0, positions).to(dtype=x.dtype)
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        rotated = torch.stack(
+            (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1
+        )
+        return rotated.flatten(-2)
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout):
+    def __init__(self, d_model, n_heads, dropout, max_position_embeddings=4096):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
@@ -28,6 +72,7 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.dropout = dropout
+        self.rotary = RotaryEmbedding(self.head_dim, max_position_embeddings)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
@@ -48,18 +93,26 @@ class Attention(nn.Module):
         attention_mask=None,
         is_causal=False,
         cache=None,
+        query_positions=None,
+        key_positions=None,
     ):
         q = self.split_heads(self.q_proj(query))
+        if query_positions is not None:
+            q = self.rotary(q, query_positions)
 
         if key_value is None:
             k = self.split_heads(self.k_proj(query))
             v = self.split_heads(self.v_proj(query))
+            if key_positions is not None:
+                k = self.rotary(k, key_positions)
             if cache is not None:
                 k = torch.cat((cache[0], k), dim=2)
                 v = torch.cat((cache[1], v), dim=2)
         elif cache is None:
             k = self.split_heads(self.k_proj(key_value))
             v = self.split_heads(self.v_proj(key_value))
+            if key_positions is not None:
+                k = self.rotary(k, key_positions)
         else:
             k, v = cache
 
@@ -75,31 +128,38 @@ class Attention(nn.Module):
         return output, (k, v)
 
 
-class FeedForward(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, d_model, d_ff, dropout):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-        )
+        # Keep the parameter budget close to a two-projection GELU FFN:
+        # 3 * d_model * hidden ~= 2 * d_model * d_ff.
+        hidden_dim = max(8, round((2 * d_ff) / 3 / 8) * 8)
+        self.gate_proj = nn.Linear(d_model, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.layers(x)
+        return self.down_proj(self.dropout(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class EncoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.norm1 = nn.LayerNorm(config.d_model)
-        self.norm2 = nn.LayerNorm(config.d_model)
-        self.attention = Attention(config.d_model, config.n_heads, config.dropout)
-        self.feed_forward = FeedForward(config.d_model, config.d_ff, config.dropout)
+        self.norm1 = RMSNorm(config.d_model, config.norm_eps)
+        self.norm2 = RMSNorm(config.d_model, config.norm_eps)
+        self.attention = Attention(
+            config.d_model, config.n_heads, config.dropout,
+            config.max_source_length,
+        )
+        self.feed_forward = SwiGLU(config.d_model, config.d_ff, config.dropout)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, attention_mask):
-        output, _ = self.attention(self.norm1(x), attention_mask=attention_mask)
+    def forward(self, x, attention_mask, positions=None):
+        output, _ = self.attention(
+            self.norm1(x), attention_mask=attention_mask,
+            query_positions=positions, key_positions=positions,
+        )
         x = x + self.dropout(output)
         x = x + self.dropout(self.feed_forward(self.norm2(x)))
         return x
@@ -108,12 +168,18 @@ class EncoderLayer(nn.Module):
 class DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.norm1 = nn.LayerNorm(config.d_model)
-        self.norm2 = nn.LayerNorm(config.d_model)
-        self.norm3 = nn.LayerNorm(config.d_model)
-        self.self_attention = Attention(config.d_model, config.n_heads, config.dropout)
-        self.cross_attention = Attention(config.d_model, config.n_heads, config.dropout)
-        self.feed_forward = FeedForward(config.d_model, config.d_ff, config.dropout)
+        self.norm1 = RMSNorm(config.d_model, config.norm_eps)
+        self.norm2 = RMSNorm(config.d_model, config.norm_eps)
+        self.norm3 = RMSNorm(config.d_model, config.norm_eps)
+        self.self_attention = Attention(
+            config.d_model, config.n_heads, config.dropout,
+            config.max_target_length,
+        )
+        self.cross_attention = Attention(
+            config.d_model, config.n_heads, config.dropout,
+            max(config.max_source_length, config.max_target_length),
+        )
+        self.feed_forward = SwiGLU(config.d_model, config.d_ff, config.dropout)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(
@@ -124,11 +190,15 @@ class DecoderLayer(nn.Module):
         self_cache=None,
         cross_cache=None,
         incremental=False,
+        target_positions=None,
+        source_positions=None,
     ):
         output, self_cache = self.self_attention(
             self.norm1(x),
             is_causal=not incremental,
             cache=self_cache,
+            query_positions=target_positions,
+            key_positions=target_positions,
         )
         x = x + self.dropout(output)
 
@@ -137,6 +207,8 @@ class DecoderLayer(nn.Module):
             key_value=encoder_output,
             attention_mask=source_mask,
             cache=cross_cache,
+            query_positions=target_positions,
+            key_positions=source_positions,
         )
         x = x + self.dropout(output)
         x = x + self.dropout(self.feed_forward(self.norm3(x)))
@@ -149,16 +221,14 @@ class Transformer(nn.Module):
         self.config = config
         self.source_embedding = nn.Embedding(config.source_vocab_size, config.d_model)
         self.target_embedding = nn.Embedding(config.target_vocab_size, config.d_model)
-        self.source_position = nn.Embedding(config.max_source_length, config.d_model)
-        self.target_position = nn.Embedding(config.max_target_length, config.d_model)
         self.encoder = nn.ModuleList(
             [EncoderLayer(config) for _ in range(config.encoder_layers)]
         )
         self.decoder = nn.ModuleList(
             [DecoderLayer(config) for _ in range(config.decoder_layers)]
         )
-        self.encoder_norm = nn.LayerNorm(config.d_model)
-        self.decoder_norm = nn.LayerNorm(config.d_model)
+        self.encoder_norm = RMSNorm(config.d_model, config.norm_eps)
+        self.decoder_norm = RMSNorm(config.d_model, config.norm_eps)
         self.dropout = nn.Dropout(config.dropout)
         self.lm_head = nn.Linear(config.d_model, config.target_vocab_size, bias=False)
         self.apply(self.init_weights)
@@ -181,11 +251,11 @@ class Transformer(nn.Module):
             raise ValueError("source sequence is too long")
 
         positions = torch.arange(length, device=source_ids.device)
-        x = self.source_embedding(source_ids) + self.source_position(positions)
+        x = self.source_embedding(source_ids)
         x = self.dropout(x)
         mask = self.source_mask(source_attention_mask)
         for layer in self.encoder:
-            x = layer(x, mask)
+            x = layer(x, mask, positions)
         return self.encoder_norm(x), mask
 
     def decode(
@@ -202,7 +272,10 @@ class Transformer(nn.Module):
             raise ValueError("target sequence is too long")
 
         positions = torch.arange(offset, offset + length, device=target_ids.device)
-        x = self.target_embedding(target_ids) + self.target_position(positions)
+        source_positions = torch.arange(
+            encoder_output.shape[1], device=target_ids.device
+        )
+        x = self.target_embedding(target_ids)
         x = self.dropout(x)
 
         new_cache = []
@@ -216,6 +289,8 @@ class Transformer(nn.Module):
                 self_cache,
                 cross_cache,
                 incremental,
+                positions,
+                source_positions,
             )
             new_cache.append(layer_cache)
 
@@ -237,6 +312,7 @@ class Transformer(nn.Module):
         max_new_tokens=512,
         num_beams=1,
         length_penalty=1.0,
+        return_all_beams=False,
     ):
         if num_beams < 1:
             raise ValueError("num_beams must be positive")
@@ -267,6 +343,7 @@ class Transformer(nn.Module):
                 pad_token_id,
                 num_beams,
                 length_penalty,
+                return_all_beams,
             )
         self.train(was_training)
         return output
@@ -329,6 +406,7 @@ class Transformer(nn.Module):
         pad_token_id,
         num_beams,
         length_penalty,
+        return_all_beams=False,
     ):
         batch_size, source_length, hidden_size = encoder_output.shape
         device = encoder_output.device
@@ -455,9 +533,14 @@ class Transformer(nn.Module):
         active_scores = beam_scores / float(max(last_step, 1)) ** length_penalty
         best_beams = active_scores.argmax(dim=-1)
         best_indices = best_beams + torch.arange(batch_size, device=device) * num_beams
+        all_active = generated.view(batch_size, num_beams, steps)
         best_active = generated.index_select(0, best_indices)
         has_completed = torch.isfinite(completed_scores)
         best_active[has_completed] = completed[has_completed]
+        if return_all_beams:
+            all_active = all_active[:, :, :last_step]
+            all_active[:, 0] = best_active[:, :last_step]
+            return all_active
         return best_active[:, :last_step]
 
     @staticmethod

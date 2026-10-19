@@ -12,9 +12,22 @@ def texts(dataset, column):
         yield row[column].replace("\r\n", "\n")
 
 
-def train_tokenizer(dataset, column, vocab_size, min_frequency):
+def shared_texts(dataset):
+    for row in dataset:
+        yield row["question"].replace("\r\n", "\n")
+        yield row["code"].replace("\r\n", "\n")
+
+
+def train_tokenizer(dataset, column, vocab_size, min_frequency, split_digits=False):
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.pre_tokenizer = (
+        pre_tokenizers.Sequence(
+            [pre_tokenizers.Digits(individual_digits=True), byte_level]
+        )
+        if split_digits
+        else byte_level
+    )
     tokenizer.decoder = decoders.ByteLevel()
 
     trainer = BpeTrainer(
@@ -32,14 +45,44 @@ def train_tokenizer(dataset, column, vocab_size, min_frequency):
     return tokenizer
 
 
+def train_shared_tokenizer(dataset, vocab_size, min_frequency):
+    tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Digits(individual_digits=True),
+            pre_tokenizers.ByteLevel(add_prefix_space=False),
+        ]
+    )
+    tokenizer.decoder = decoders.ByteLevel()
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        special_tokens=SPECIAL_TOKENS,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    )
+    length = len(dataset) * 2 if hasattr(dataset, "__len__") else None
+    tokenizer.train_from_iterator(
+        shared_texts(dataset),
+        trainer=trainer,
+        length=length,
+    )
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="$A <eos>",
+        special_tokens=[("<eos>", tokenizer.token_to_id("<eos>"))],
+    )
+    return tokenizer
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input")
     parser.add_argument("--dataset", default="SlavaYus/tinysms_qa_12m")
     parser.add_argument("--source-output", default="source_tokenizer.json")
     parser.add_argument("--target-output", default="target_tokenizer.json")
+    parser.add_argument("--shared-output")
     parser.add_argument("--source-vocab-size", type=int, default=4096)
     parser.add_argument("--target-vocab-size", type=int, default=8192)
+    parser.add_argument("--shared-vocab-size", type=int, default=8192)
     parser.add_argument("--min-frequency", type=int, default=10)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
@@ -52,6 +95,15 @@ def main():
         dataset = load_from_disk(args.input)
         if args.limit is not None:
             dataset = dataset.select(range(min(args.limit, len(dataset))))
+
+    if args.shared_output is not None:
+        shared_tokenizer = train_shared_tokenizer(
+            dataset,
+            args.shared_vocab_size,
+            args.min_frequency,
+        )
+        shared_tokenizer.save(args.shared_output)
+        return
 
     source_tokenizer = train_tokenizer(
         dataset,
