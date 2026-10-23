@@ -24,15 +24,15 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints/rtx5090-step32000/inference-best.pt"),
+        default=Path("inference-best.pt"),
     )
     parser.add_argument("--questions", type=Path, default=Path("data/test.parquet"))
     parser.add_argument("--output", type=Path, default=Path("predictions.jsonl"))
     parser.add_argument(
-        "--source-tokenizer", type=Path, default=Path("source_tokenizer.json")
+        "--source-tokenizer", type=Path, default=Path("shared_tokenizer.json")
     )
     parser.add_argument(
-        "--target-tokenizer", type=Path, default=Path("target_tokenizer.json")
+        "--target-tokenizer", type=Path, default=Path("shared_tokenizer.json")
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=256)

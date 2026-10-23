@@ -1,7 +1,10 @@
 import argparse
+import contextlib
+import io
 import math
 import os
 import random
+import signal
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -18,6 +21,42 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model import ModelConfig, Transformer, shift_right
+from operator_loss import operator_weights, weighted_cross_entropy
+
+
+class CodeExecutionTimeout(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def code_execution_timeout(seconds):
+    def handle_timeout(signum, frame):
+        raise CodeExecutionTimeout(f"execution exceeded {seconds:.2f}s")
+
+    previous_handler = signal.signal(signal.SIGALRM, handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def execute_solve(code, timeout_seconds=0.2):
+    namespace = {}
+    try:
+        with code_execution_timeout(timeout_seconds):
+            with contextlib.redirect_stdout(io.StringIO()):
+                exec(code, namespace, namespace)
+                value = namespace["solve"]()
+        if hasattr(value, "item"):
+            value = value.item()
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except Exception:
+        return None
 
 
 class Collator:
@@ -28,12 +67,14 @@ class Collator:
         source_length,
         target_length,
         pad_to_max_length=False,
+        arithmetic_operator_weight=1.0,
     ):
         self.source_tokenizer = Tokenizer.from_file(str(source_tokenizer_path))
         self.target_tokenizer = Tokenizer.from_file(str(target_tokenizer_path))
         self.source_length = source_length
         self.target_length = target_length
         self.pad_to_max_length = pad_to_max_length
+        self.arithmetic_operator_weight = arithmetic_operator_weight
         self.source_pad_id = self.source_tokenizer.token_to_id("<pad>")
         self.source_eos_id = self.source_tokenizer.token_to_id("<eos>")
         self.target_pad_id = self.target_tokenizer.token_to_id("<pad>")
@@ -72,7 +113,7 @@ class Collator:
             self.target_eos_id,
             -100,
         )
-        return {
+        result = {
             "source_ids": source_ids,
             "source_mask": source_ids.ne(self.source_pad_id),
             "labels": labels,
@@ -82,6 +123,19 @@ class Collator:
                 self.target_pad_id,
             ),
         }
+        if self.arithmetic_operator_weight != 1.0:
+            rows = []
+            for example, encoding in zip(examples, self.target_tokenizer.encode_batch(
+                [example["code"] for example in examples]
+            )):
+                weights = operator_weights(example["code"], encoding,
+                                           self.arithmetic_operator_weight)
+                if len(weights) > self.target_length:
+                    weights = weights[:self.target_length]
+                    weights[-1] = 1.0  # truncation replaces this token with EOS
+                rows.append(weights + [0.0] * (labels.shape[1] - len(weights)))
+            result["loss_weights"] = torch.tensor(rows, dtype=torch.float32)
+        return result
 
 
 def get_device():
@@ -106,10 +160,12 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def make_scheduler(optimizer, warmup_steps, total_steps):
+def make_scheduler(optimizer, warmup_steps, total_steps, schedule_type="cosine"):
     def schedule(step):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
+        if schedule_type == "constant":
+            return 1.0
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
@@ -157,7 +213,7 @@ def save_checkpoint(
     total_steps,
     batch_size,
     gradient_accumulation,
-    best_validation_loss=float("inf"),
+    best_execution_accuracy=float("-inf"),
 ):
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(
@@ -173,7 +229,7 @@ def save_checkpoint(
             "total_steps": total_steps,
             "batch_size": batch_size,
             "gradient_accumulation": gradient_accumulation,
-            "best_validation_loss": best_validation_loss,
+            "best_execution_accuracy": best_execution_accuracy,
         },
         temporary_path,
     )
@@ -295,6 +351,80 @@ def log_generation_samples(
     )
 
 
+@torch.inference_mode()
+def log_execution_accuracy(
+    experiment,
+    model,
+    collator,
+    target_tokenizer,
+    examples,
+    device,
+    step,
+    batch_size,
+    num_beams,
+):
+    """Generate and execute a fixed validation prefix, then log answer accuracy."""
+    bos_id = target_tokenizer.token_to_id("<bos>")
+    eos_id = target_tokenizer.token_to_id("<eos>")
+    pad_id = target_tokenizer.token_to_id("<pad>")
+    valid_predictions = 0
+    valid_references = 0
+    correct = 0
+
+    model.eval()
+    for start in range(0, len(examples), batch_size):
+        batch_examples = examples[start : start + batch_size]
+        batch = collator(batch_examples)
+        source_ids = batch["source_ids"].to(device)
+        source_mask = batch["source_mask"].to(device)
+        generated = model.generate(
+            source_ids,
+            source_mask,
+            bos_id,
+            eos_id,
+            pad_id,
+            model.config.max_target_length,
+            num_beams=num_beams,
+        ).cpu().tolist()
+
+        for example, generated_ids in zip(batch_examples, generated):
+            prediction = target_tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+            )
+            predicted_value = execute_solve(prediction)
+            reference_value = execute_solve(example["code"])
+            if predicted_value is not None:
+                valid_predictions += 1
+            if reference_value is not None:
+                valid_references += 1
+            if (
+                predicted_value is not None
+                and reference_value is not None
+                and math.isclose(
+                    predicted_value,
+                    reference_value,
+                    rel_tol=1e-6,
+                    abs_tol=1e-6,
+                )
+            ):
+                correct += 1
+
+    total = len(examples)
+    experiment.log_metrics(
+        {
+            "validation/execution_accuracy": correct / max(1, total),
+            "validation/execution_valid_predictions": valid_predictions / max(1, total),
+            "validation/execution_valid_references": valid_references / max(1, total),
+            "validation/execution_correct": correct,
+            "validation/execution_examples": total,
+        },
+        step=step,
+    )
+    model.train()
+    return correct / max(1, total), valid_predictions
+
+
 def archive_checkpoint(source, destination):
     """Keep an atomic, zero-copy snapshot of a completed checkpoint."""
     temporary_path = destination.with_suffix(destination.suffix + ".tmp")
@@ -313,34 +443,68 @@ def parse_args():
     parser.add_argument(
         "--source-tokenizer",
         type=Path,
-        default=Path("source_tokenizer.json"),
+        default=Path("shared_tokenizer.json"),
     )
     parser.add_argument(
         "--target-tokenizer",
         type=Path,
-        default=Path("target_tokenizer.json"),
+        default=Path("shared_tokenizer.json"),
     )
     parser.add_argument("--output", type=Path, default=Path("checkpoints"))
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--gradient-accumulation", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--scheduler-steps",
+        type=int,
+        help=(
+            "cosine schedule horizon in optimizer steps; unlike --max-steps, "
+            "this does not stop training"
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=640)
     parser.add_argument("--n-heads", type=int, default=10)
     parser.add_argument("--d-ff", type=int, default=2560)
     parser.add_argument("--encoder-layers", type=int, default=8)
     parser.add_argument("--decoder-layers", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--tie-embeddings",
+        action="store_true",
+        help="share encoder input, decoder input, and output embedding weights",
+    )
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--arithmetic-operator-weight", type=float, default=1.0)
+    parser.add_argument("--data-seed", type=int)
+    parser.add_argument("--new-comet-run", action="store_true")
+    parser.add_argument("--lr-schedule", choices=("cosine", "constant"), default="cosine")
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        help="explicit warmup length; takes precedence over --warmup-ratio",
+    )
     parser.add_argument("--max-source-length", type=int, default=192)
     parser.add_argument("--max-target-length", type=int, default=256)
     parser.add_argument("--validation-size", type=int, default=10000)
     parser.add_argument("--validation-batches", type=int, default=100)
+    parser.add_argument(
+        "--validation-generation-samples",
+        type=int,
+        default=1000,
+        help="number of validation prompts used for execution accuracy",
+    )
+    parser.add_argument(
+        "--validation-generation-beams",
+        type=int,
+        default=1,
+        help="beam width used for validation execution accuracy",
+    )
     parser.add_argument("--validate-every", type=int, default=1000)
     parser.add_argument("--logged-generation-samples", type=int, default=4)
-    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-patience", type=int, default=8)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--pad-to-max-length", action="store_true")
@@ -367,22 +531,59 @@ def parse_args():
         action="store_true",
         help="save inference checkpoints locally without uploading them to Comet",
     )
-    parser.add_argument("--resume", type=Path)
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--extend-resume",
+        action="store_true",
+        help=(
+            "allow --resume to extend a completed checkpoint to a larger "
+            "--max-steps value while preserving optimizer and scheduler state"
+        ),
+    )
+    resume_group.add_argument(
+        "--finetune-from",
+        type=Path,
+        help=(
+            "load model weights from a completed checkpoint and start a new "
+            "optimizer/scheduler"
+        ),
+    )
+    parser.add_argument(
+        "--finetune-steps",
+        type=int,
+        default=10000,
+        help="number of additional optimizer steps when --finetune-from is used",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if not math.isfinite(args.arithmetic_operator_weight) or args.arithmetic_operator_weight <= 0:
+        raise ValueError("arithmetic_operator_weight must be finite and positive")
     if args.checkpoint_every < 1:
         raise ValueError("checkpoint_every must be positive")
     if args.validate_every < 1:
         raise ValueError("validate_every must be positive")
     if args.logged_generation_samples < 1:
         raise ValueError("logged_generation_samples must be positive")
+    if args.validation_generation_samples < 1:
+        raise ValueError("validation_generation_samples must be positive")
+    if args.validation_generation_beams < 1:
+        raise ValueError("validation_generation_beams must be positive")
     if args.early_stopping_patience < 1:
         raise ValueError("early_stopping_patience must be positive")
     if args.early_stopping_min_delta < 0:
         raise ValueError("early_stopping_min_delta must be non-negative")
+    if args.finetune_steps < 1:
+        raise ValueError("finetune_steps must be positive")
+    if args.scheduler_steps is not None and args.scheduler_steps < 1:
+        raise ValueError("scheduler_steps must be positive")
+    if args.warmup_steps is not None and args.warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if args.finetune_steps != 10000 and args.finetune_from is None:
+        raise ValueError("--finetune-steps requires --finetune-from")
     if args.archive_every < 1:
         raise ValueError("archive_every must be positive")
     if args.archive_every % args.checkpoint_every != 0:
@@ -398,6 +599,7 @@ def main():
         args.max_source_length,
         args.max_target_length,
         args.pad_to_max_length,
+        args.arithmetic_operator_weight,
     )
 
     if args.dataset_repo:
@@ -417,12 +619,18 @@ def main():
         "train": [split["train"][index] for index in range(logged_samples)],
         "validation": [split["test"][index] for index in range(logged_samples)],
     }
+    execution_validation_examples = [
+        split["test"][index]
+        for index in range(min(args.validation_generation_samples, len(split["test"])))
+    ]
 
     pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         split["train"],
         batch_size=args.batch_size,
         shuffle=True,
+        generator=(torch.Generator().manual_seed(args.data_seed)
+                   if args.data_seed is not None else None),
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         collate_fn=collator,
@@ -449,6 +657,7 @@ def main():
         max_source_length=args.max_source_length,
         max_target_length=args.max_target_length,
         dropout=args.dropout,
+        tie_embeddings=args.tie_embeddings,
     )
     device = get_device()
     amp_enabled, amp_dtype = get_amp(device)
@@ -464,42 +673,79 @@ def main():
         fused=device.type == "cuda",
     )
 
-    total_steps = len(train_loader) * args.epochs // args.gradient_accumulation
-    if args.max_steps is not None:
-        total_steps = min(total_steps, args.max_steps)
-    warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler = make_scheduler(optimizer, warmup_steps, total_steps)
+    checkpoint = None
+    finetune_mode = args.finetune_from is not None
+    if args.resume is not None or finetune_mode:
+        checkpoint_path = args.resume if args.resume is not None else args.finetune_from
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if checkpoint["config"] != asdict(config):
+            raise ValueError("checkpoint config does not match training config")
+        if checkpoint.get("batch_size", args.batch_size) != args.batch_size:
+            raise ValueError("checkpoint batch size does not match training config")
+        if checkpoint.get(
+            "gradient_accumulation", args.gradient_accumulation
+        ) != args.gradient_accumulation:
+            raise ValueError("checkpoint gradient accumulation does not match training config")
+
+    checkpoint_step = checkpoint.get("step", 0) if checkpoint is not None else 0
+    if finetune_mode:
+        if args.max_steps is not None:
+            raise ValueError("use --finetune-steps instead of --max-steps with --finetune-from")
+        total_steps = checkpoint_step + args.finetune_steps
+        scheduler_steps = args.scheduler_steps or args.finetune_steps
+        batches_needed = args.finetune_steps * args.gradient_accumulation
+        args.epochs = max(
+            args.epochs,
+            math.ceil(batches_needed / max(1, len(train_loader))),
+        )
+    else:
+        epoch_steps = len(train_loader) * args.epochs // args.gradient_accumulation
+        total_steps = epoch_steps
+        if args.max_steps is not None:
+            total_steps = min(total_steps, args.max_steps)
+        scheduler_steps = args.scheduler_steps or total_steps
+    if scheduler_steps < total_steps - checkpoint_step:
+        raise ValueError("scheduler_steps cannot be shorter than the training run")
+    warmup_steps = (
+        args.warmup_steps
+        if args.warmup_steps is not None
+        else int(scheduler_steps * args.warmup_ratio)
+    )
+    if warmup_steps >= scheduler_steps:
+        raise ValueError("warmup_steps must be shorter than scheduler_steps")
+    scheduler = make_scheduler(optimizer, warmup_steps, scheduler_steps, args.lr_schedule)
     scaler = torch.amp.GradScaler(
         device.type,
         enabled=amp_enabled and amp_dtype == torch.float16,
     )
 
-    checkpoint = None
     global_step = 0
     samples_seen = 0
-    best_validation_loss = float("inf")
+    best_execution_accuracy = float("-inf")
     if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if checkpoint["config"] != asdict(config):
-            raise ValueError("checkpoint config does not match training config")
-        if checkpoint.get("total_steps", total_steps) != total_steps:
-            raise ValueError("checkpoint total steps do not match")
-        if checkpoint.get("batch_size", args.batch_size) != args.batch_size:
-            raise ValueError("checkpoint batch size does not match")
-        if checkpoint.get(
-            "gradient_accumulation",
-            args.gradient_accumulation,
-        ) != args.gradient_accumulation:
-            raise ValueError("checkpoint gradient accumulation does not match")
+        checkpoint_total_steps = checkpoint.get("total_steps", total_steps)
+        if checkpoint_total_steps != total_steps:
+            extending = args.extend_resume and total_steps > checkpoint_total_steps
+            if not extending:
+                raise ValueError(
+                    "checkpoint total steps do not match; use --extend-resume "
+                    "with a larger --max-steps value to continue a completed run"
+                )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         scaler.load_state_dict(checkpoint["scaler"])
         global_step = checkpoint["step"]
         samples_seen = checkpoint.get("samples_seen", 0)
-        best_validation_loss = checkpoint.get("best_validation_loss", float("inf"))
+        best_execution_accuracy = checkpoint.get(
+            "best_execution_accuracy", float("-inf")
+        )
         if global_step >= total_steps:
             raise ValueError("checkpoint has already reached total steps")
+    elif finetune_mode:
+        model.load_state_dict(checkpoint["model"])
+        global_step = checkpoint_step
+        samples_seen = checkpoint.get("samples_seen", 0)
 
     parameters = sum(parameter.numel() for parameter in model.parameters())
     experiment_parameters = {
@@ -511,7 +757,7 @@ def main():
         args.batch_size * args.gradient_accumulation
     )
     experiment_key = None
-    if checkpoint is not None:
+    if checkpoint is not None and not args.new_comet_run:
         experiment_key = checkpoint.get("comet_experiment_key")
     if experiment_key is None:
         experiment_mode = "create"
@@ -552,9 +798,15 @@ def main():
     logging_steps = 0
     session_samples = 0
     start = time.perf_counter()
-    completed_batches = global_step * args.gradient_accumulation
-    start_epoch = completed_batches // len(train_loader)
-    batches_to_skip = completed_batches % len(train_loader)
+    if finetune_mode:
+        # The new optimizer/scheduler starts at local step zero, while the
+        # externally visible step counter continues from the source checkpoint.
+        start_epoch = 0
+        batches_to_skip = 0
+    else:
+        completed_batches = global_step * args.gradient_accumulation
+        start_epoch = completed_batches // len(train_loader)
+        batches_to_skip = completed_batches % len(train_loader)
     validation_loss = None
     validations_without_improvement = 0
     stop_training = False
@@ -576,11 +828,14 @@ def main():
                     batch["target_ids"],
                     batch["source_mask"],
                 )
-                loss = F.cross_entropy(
-                    logits.flatten(0, 1),
-                    batch["labels"].flatten(),
-                    ignore_index=-100,
-                )
+                if "loss_weights" in batch:
+                    loss = weighted_cross_entropy(logits, batch["labels"], batch["loss_weights"])
+                else:
+                    loss = F.cross_entropy(
+                        logits.flatten(0, 1),
+                        batch["labels"].flatten(),
+                        ignore_index=-100,
+                    )
                 scaled_loss = loss / args.gradient_accumulation
 
             scaler.scale(scaled_loss).backward()
@@ -645,6 +900,17 @@ def main():
                     validation_loss,
                     step=global_step,
                 )
+                execution_accuracy, valid_predictions = log_execution_accuracy(
+                    experiment,
+                    model,
+                    collator,
+                    target_tokenizer,
+                    execution_validation_examples,
+                    device,
+                    global_step,
+                    args.batch_size,
+                    args.validation_generation_beams,
+                )
                 if args.comet_mode != "disabled":
                     log_generation_samples(
                         experiment,
@@ -656,13 +922,15 @@ def main():
                         global_step,
                     )
                 progress.write(
-                    f"step={global_step} validation_loss={validation_loss:.4f}"
+                    f"step={global_step} validation_loss={validation_loss:.4f} "
+                    f"execution_accuracy={execution_accuracy:.4f} "
+                    f"valid_predictions={valid_predictions}/{len(execution_validation_examples)}"
                 )
                 if (
-                    validation_loss
-                    < best_validation_loss - args.early_stopping_min_delta
+                    execution_accuracy
+                    > best_execution_accuracy + args.early_stopping_min_delta
                 ):
-                    best_validation_loss = validation_loss
+                    best_execution_accuracy = execution_accuracy
                     validations_without_improvement = 0
                     save_checkpoint(
                         args.output / "best.pt",
@@ -677,7 +945,7 @@ def main():
                         total_steps,
                         args.batch_size,
                         args.gradient_accumulation,
-                        best_validation_loss,
+                        best_execution_accuracy,
                     )
                     best_inference_path = args.output / "inference-best.pt"
                     save_inference_checkpoint(
@@ -688,7 +956,9 @@ def main():
                         samples_seen,
                         validation_loss,
                     )
-                    experiment.log_other("best_validation_loss", best_validation_loss)
+                    experiment.log_other(
+                        "best_execution_accuracy", best_execution_accuracy
+                    )
                     experiment.log_other("best_step", global_step)
                 else:
                     validations_without_improvement += 1
@@ -697,7 +967,7 @@ def main():
                         >= args.early_stopping_patience
                     ):
                         progress.write(
-                            "early stopping: validation loss did not improve "
+                            "early stopping: execution accuracy did not improve "
                             f"for {validations_without_improvement} checks"
                         )
                         stop_training = True
@@ -716,7 +986,7 @@ def main():
                     total_steps,
                     args.batch_size,
                     args.gradient_accumulation,
-                    best_validation_loss,
+                    best_execution_accuracy,
                 )
                 if global_step % args.archive_every == 0:
                     archive_checkpoint(
@@ -758,7 +1028,7 @@ def main():
         total_steps,
         args.batch_size,
         args.gradient_accumulation,
-        best_validation_loss,
+        best_execution_accuracy,
     )
     inference_path = args.output / "inference.pt"
     save_inference_checkpoint(
@@ -788,7 +1058,7 @@ def main():
     experiment.log_metrics(
         {
             "validation/loss": validation_loss,
-            "validation/best_loss": best_validation_loss,
+            "validation/best_execution_accuracy": best_execution_accuracy,
             "train/optimizer_step": global_step,
             "train/samples_seen": samples_seen,
             "train/total_minutes": elapsed / 60,
@@ -798,7 +1068,7 @@ def main():
     experiment.log_other("checkpoint", str(args.output / "model.pt"))
     experiment.end()
     print(f"validation_loss={validation_loss:.4f}")
-    print(f"best_validation_loss={best_validation_loss:.4f}")
+    print(f"best_execution_accuracy={best_execution_accuracy:.4f}")
     print(f"saved_best={args.output / 'best.pt'}")
     print(f"saved_best_inference={args.output / 'inference-best.pt'}")
     print(f"saved={args.output / 'model.pt'}")

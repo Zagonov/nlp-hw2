@@ -66,12 +66,9 @@ def main():
     args = parse_args()
     questions_path = args.questions or find_input("pass1_questions.jsonl")
     checkpoint_path = args.checkpoint or find_checkpoint()
-    source_tokenizer_path = args.source_tokenizer or find_input(
-        "source_tokenizer.json"
-    )
-    target_tokenizer_path = args.target_tokenizer or find_input(
-        "target_tokenizer.json"
-    )
+    shared_tokenizer_path = find_input("shared_tokenizer.json")
+    source_tokenizer_path = args.source_tokenizer or shared_tokenizer_path
+    target_tokenizer_path = args.target_tokenizer or shared_tokenizer_path
 
     if not torch.cuda.is_available():
         raise RuntimeError("Enable a GPU accelerator in the Kaggle notebook settings")
